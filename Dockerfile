@@ -1,15 +1,28 @@
 # ── Montaje RunPod Worker ──────────────────────────────────────────────────────
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 \
+        python3.10-dev \
+        python3-pip \
         ffmpeg \
         libass9 \
         fonts-liberation \
         fontconfig \
         curl \
+    && ln -sf python3.10 /usr/bin/python3 \
+    && ln -sf python3 /usr/bin/python \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        torch==2.1.0 \
+        torchvision==0.16.0 \
+        torchaudio==2.1.0 \
+        --index-url https://download.pytorch.org/whl/cu121
 
 RUN pip install --no-cache-dir \
         runpod==1.7.3 \
@@ -25,5 +38,4 @@ RUN pip install --no-cache-dir \
 RUN python -c "import whisper; whisper.load_model('large'); print('Whisper large OK')"
 
 COPY handler.py .
-ENV PYTHONUNBUFFERED=1
 CMD ["python", "handler.py"]
