@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir \
         runpod==1.9.0 \
+        numpy \
         openai-whisper \
         faster-whisper \
         requests \
