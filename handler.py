@@ -1,14 +1,10 @@
 """
 handler.py — RunPod Serverless · Montaje de Vídeo Bíblico
-==========================================================
-Stack : FFmpeg + Whisper large + Ken Burns + Subtítulos Karaoke ASS
 """
 
 import os, json, base64, logging, subprocess, shutil, time
-import torch
 import requests
 import runpod
-import whisper
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("montaje-worker")
@@ -40,16 +36,17 @@ ASS_HEADER = (
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
 )
 
-# ── Whisper carga LAZY (no al arrancar) ───────────────────────────────────────
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ── Whisper LAZY ──────────────────────────────────────────────────────────────
 _whisper_model = None
 
 def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        log.info("Cargando Whisper large (lazy)...")
-        _whisper_model = whisper.load_model("large", device=_DEVICE)
-        log.info(f"Whisper large listo en {_DEVICE}.")
+        import torch, whisper
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        log.info(f"Cargando Whisper large en {device} (lazy)...")
+        _whisper_model = whisper.load_model("large", device=device)
+        log.info("Whisper large listo.")
     return _whisper_model
 
 
@@ -109,7 +106,6 @@ def calcular_duraciones(n_escenas, duracion_total_seg):
     t_fase1   = n_fase1 * DUR_FASE1
     n_fase2   = n_escenas - n_fase1
     dur_fase2 = (duracion_total_seg - t_fase1) / n_fase2 if n_fase2 > 0 else 0.0
-    log.info(f"  Distribución: {n_fase1}×{DUR_FASE1:.0f}s + {n_fase2}×{dur_fase2:.1f}s")
     return [DUR_FASE1 if i < n_fase1 else dur_fase2 for i in range(n_escenas)]
 
 
@@ -219,7 +215,7 @@ def handler(job):
     folder_id     = inp.get("drive_folder_id", "")
     sa_json       = inp.get("gdrive_sa_json", "")
 
-    if not audio_url:    return {"error": "Falta 'audio_url'", "success": False}
+    if not audio_url:     return {"error": "Falta 'audio_url'", "success": False}
     if not imagenes_urls: return {"error": "Falta 'imagenes_urls'", "success": False}
     if not duracion_seg:  return {"error": "Falta 'duracion_seg'", "success": False}
 
@@ -234,11 +230,9 @@ def handler(job):
     try:
         log.info(f"MONTAJE: {slug} — {len(imagenes_urls)} escenas — {duracion_seg/60:.1f} min")
 
-        # 1. Audio
         audio_path = f"{workdir}/audio.mp3"
         download_file(audio_url, audio_path, "audio MP3")
 
-        # 2. Imágenes
         imagen_paths = []
         for i, url in enumerate(imagenes_urls, 1):
             dest = f"{imgs_dir}/escena_{i:03d}.png"
@@ -249,7 +243,6 @@ def handler(job):
                 log.warning(f"  ⚠ escena {i:03d}: {e}")
                 imagen_paths.append(None)
 
-        # 3. Ken Burns
         duraciones = calcular_duraciones(len(imagen_paths), duracion_seg)
         clips = []
         for i, (img, dur) in enumerate(zip(imagen_paths, duraciones), 1):
@@ -265,7 +258,6 @@ def handler(job):
                 apply_ken_burns(img, dur, out, i)
             clips.append(out)
 
-        # 4. Concat
         lista_txt = f"{workdir}/lista_clips.txt"
         with open(lista_txt, "w") as f:
             for c in clips:
@@ -275,10 +267,13 @@ def handler(job):
                     "-c:v", "libx264", "-preset", "fast", "-crf", str(VIDEO_CRF),
                     "-pix_fmt", "yuv420p", video_sin_audio], "concat clips")
 
-        # 5. Whisper LAZY
         words_timing = []
         try:
-            result = _get_whisper().transcribe(audio_path, language="es", word_timestamps=True, fp16=(_DEVICE=="cuda"))
+            import torch
+            result = _get_whisper().transcribe(
+                audio_path, language="es", word_timestamps=True,
+                fp16=torch.cuda.is_available()
+            )
             for seg in result.get("segments", []):
                 for w in seg.get("words", []):
                     raw = w.get("word", "").strip()
@@ -289,7 +284,6 @@ def handler(job):
         except Exception as e:
             log.warning(f"  ⚠ Whisper falló: {e}")
 
-        # 6. ASS
         ass_path = f"{subs_dir}/subtitulos.ass"
         if words_timing:
             generar_ass_whisper(words_timing, duracion_seg, ass_path)
@@ -298,10 +292,8 @@ def handler(job):
         else:
             ass_path = None
 
-        # 7. Música
         musica_path = conseguir_musica(workdir, musica_url)
 
-        # 8. Montaje final
         video_final    = f"{workdir}/{slug}_FINAL.mp4"
         ass_for_ffmpeg = ass_path.replace("\\", "/") if ass_path else None
 
@@ -333,14 +325,13 @@ def handler(job):
 
         run_ffmpeg(cmd, "montaje final")
 
-        probe    = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries",
-                                   "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
-                                   video_final], capture_output=True, text=True)
+        probe = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries",
+                                "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                                video_final], capture_output=True, text=True)
         dur_final = float(probe.stdout.strip())
         size_mb   = os.path.getsize(video_final) / 1_048_576
         log.info(f"  ✓ VÍDEO: {dur_final/60:.1f} min — {size_mb:.0f} MB")
 
-        # 9. Drive
         drive_file_id = drive_url = None
         if folder_id and sa_json:
             drive_file_id, drive_url = upload_to_drive(video_final, folder_id, sa_json)
