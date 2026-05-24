@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
         runpod==1.9.0 \
         openai-whisper \
+        faster-whisper \
         requests \
         pillow \
         tqdm \
@@ -39,8 +40,7 @@ RUN curl -L "https://downloads.rclone.org/rclone-current-linux-amd64.zip" \
         -o /tmp/rclone.zip \
     && unzip /tmp/rclone.zip -d /tmp/rclone_dir \
     && mv /tmp/rclone_dir/rclone-*/rclone /usr/local/bin/ \
-    && rm -rf /tmp/rclone_dir /tmp/rclone.zip \
-    && rclone version
+    && rm -rf /tmp/rclone_dir /tmp/rclone.zip
 
 COPY handler.py .
 CMD ["python", "handler.py"]
