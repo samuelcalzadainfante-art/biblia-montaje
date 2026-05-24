@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cu121
 
 RUN pip install --no-cache-dir \
-        runpod==1.7.3 \
+        runpod==1.9.0 \
         openai-whisper \
         requests \
         pillow \
