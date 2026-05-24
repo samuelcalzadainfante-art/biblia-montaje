@@ -2,7 +2,7 @@
 handler.py — RunPod Serverless · Montaje de Vídeo Bíblico
 """
 
-import os, json, base64, logging, subprocess, shutil, time
+import os, json, base64, logging, subprocess, shutil, time, tempfile
 import requests
 import runpod
 
@@ -36,7 +36,6 @@ ASS_HEADER = (
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
 )
 
-# ── Whisper LAZY ──────────────────────────────────────────────────────────────
 _whisper_model = None
 
 def _get_whisper():
@@ -170,25 +169,37 @@ def generar_ass_guion(escenas, duracion_total, ass_path):
     return ass_path
 
 
-def upload_to_drive(file_path, folder_id, sa_json_raw):
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    from google.oauth2 import service_account
-    sa_info = json.loads(sa_json_raw) if sa_json_raw.strip().startswith("{") else json.loads(base64.b64decode(sa_json_raw).decode())
-    creds   = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/drive"])
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+def upload_to_drive(file_path, folder_id, sa_json_raw, rclone_token=""):
+    """Sube el MP4 a Google Drive usando rclone con token OAuth."""
     filename = os.path.basename(file_path)
-    media    = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True, chunksize=10*1024*1024)
-    req      = service.files().create(body={"name": filename, "parents": [folder_id]}, media_body=media, fields="id,webViewLink")
-    response = None
-    while response is None:
-        status, response = req.next_chunk()
-        if status:
-            log.info(f"  Drive: {int(status.progress()*100)}%")
-    fid = response.get("id")
-    url = response.get("webViewLink", f"https://drive.google.com/file/d/{fid}/view")
-    log.info(f"  ✓ Drive: {url}")
-    return fid, url
+
+    # Escribir config rclone temporal
+    cfg_content = f"""[gdrive]
+type = drive
+scope = drive
+token = {rclone_token}
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as cfg_file:
+        cfg_file.write(cfg_content)
+        cfg_path = cfg_file.name
+
+    try:
+        dest = f"gdrive:{folder_id}/{filename}"
+        cmd = ["rclone", "copy", "--config", cfg_path, file_path, f"gdrive:{folder_id}"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"rclone error: {result.stderr}")
+
+        # Obtener file ID
+        ls_cmd = ["rclone", "lsjson", "--config", cfg_path, f"gdrive:{folder_id}", "--files-only"]
+        ls_result = subprocess.run(ls_cmd, capture_output=True, text=True)
+        files = json.loads(ls_result.stdout) if ls_result.stdout.strip() else []
+        file_id = next((f["ID"] for f in files if f["Name"] == filename), None)
+        url = f"https://drive.google.com/file/d/{file_id}/view" if file_id else ""
+        log.info(f"  ✓ Archivo en Drive: {url}")
+        return file_id, url
+    finally:
+        os.unlink(cfg_path)
 
 
 def conseguir_musica(workdir, musica_url=""):
@@ -214,6 +225,7 @@ def handler(job):
     musica_url    = inp.get("musica_url", "")
     folder_id     = inp.get("drive_folder_id", "")
     sa_json       = inp.get("gdrive_sa_json", "")
+    rclone_token  = inp.get("rclone_token", "")
 
     if not audio_url:     return {"error": "Falta 'audio_url'", "success": False}
     if not imagenes_urls: return {"error": "Falta 'imagenes_urls'", "success": False}
@@ -333,8 +345,8 @@ def handler(job):
         log.info(f"  ✓ VÍDEO: {dur_final/60:.1f} min — {size_mb:.0f} MB")
 
         drive_file_id = drive_url = None
-        if folder_id and sa_json:
-            drive_file_id, drive_url = upload_to_drive(video_final, folder_id, sa_json)
+        if folder_id and rclone_token:
+            drive_file_id, drive_url = upload_to_drive(video_final, folder_id, sa_json, rclone_token)
 
         elapsed = (time.time() - t0) / 60
         return {"success": True, "drive_file_id": drive_file_id, "drive_url": drive_url,
