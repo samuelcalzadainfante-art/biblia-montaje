@@ -24,9 +24,10 @@ RUN pip install --no-cache-dir \
         torchaudio==2.1.0 \
         --index-url https://download.pytorch.org/whl/cu121
 
+RUN pip install --no-cache-dir 'numpy<2'
+
 RUN pip install --no-cache-dir \
         runpod==1.9.0 \
-        numpy \
         openai-whisper \
         faster-whisper \
         requests \
