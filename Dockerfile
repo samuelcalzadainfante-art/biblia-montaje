@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-liberation \
         fontconfig \
         curl \
+        unzip \
     && ln -sf python3.10 /usr/bin/python3 \
     && ln -sf python3 /usr/bin/python \
     && fc-cache -f \
@@ -33,6 +34,13 @@ RUN pip install --no-cache-dir \
         google-auth==2.25.2 \
         google-auth-httplib2==0.2.0 \
         google-auth-oauthlib==1.2.0
+
+RUN curl -L "https://downloads.rclone.org/rclone-current-linux-amd64.zip" \
+        -o /tmp/rclone.zip \
+    && unzip /tmp/rclone.zip -d /tmp/rclone_dir \
+    && mv /tmp/rclone_dir/rclone-*/rclone /usr/local/bin/ \
+    && rm -rf /tmp/rclone_dir /tmp/rclone.zip \
+    && rclone version
 
 COPY handler.py .
 CMD ["python", "handler.py"]
