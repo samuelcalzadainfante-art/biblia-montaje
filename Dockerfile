@@ -1,4 +1,3 @@
-# ── Montaje RunPod Worker ──────────────────────────────────────────────────────
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
@@ -34,8 +33,6 @@ RUN pip install --no-cache-dir \
         google-auth==2.25.2 \
         google-auth-httplib2==0.2.0 \
         google-auth-oauthlib==1.2.0
-
-RUN python -c "import whisper; whisper.load_model('large'); print('Whisper large OK')"
 
 COPY handler.py .
 CMD ["python", "handler.py"]
