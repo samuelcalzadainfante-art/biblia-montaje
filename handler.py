@@ -38,15 +38,72 @@ ASS_HEADER = (
 
 _whisper_model = None
 
+def _log_gpu_info():
+    try:
+        import torch
+        cuda_ok = torch.cuda.is_available()
+        log.info(f"  CUDA disponible: {cuda_ok}")
+        if cuda_ok:
+            log.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+            props = torch.cuda.get_device_properties(0)
+            vram_total = props.total_memory / 1024**3
+            vram_used  = torch.cuda.memory_allocated(0) / 1024**3
+            log.info(f"  VRAM total: {vram_total:.1f} GB — usada: {vram_used:.1f} GB")
+        else:
+            log.warning("  CUDA no disponible — Whisper correrá en CPU (lento)")
+    except Exception as e:
+        log.warning(f"  No se pudo obtener info GPU: {e}")
+
 def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        import torch, whisper
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        log.info(f"Cargando Whisper large en {device} (lazy)...")
-        _whisper_model = whisper.load_model("large", device=device)
-        log.info("Whisper large listo.")
+        _log_gpu_info()
+        # Intento 1: openai-whisper
+        try:
+            import torch, whisper
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            log.info(f"  Cargando openai-whisper large en {device}...")
+            _whisper_model = ("openai", whisper.load_model("large", device=device))
+            log.info("  openai-whisper large listo.")
+        except Exception as e:
+            log.warning(f"  openai-whisper falló: {e}")
+            # Intento 2: faster-whisper
+            try:
+                from faster_whisper import WhisperModel
+                device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+                compute = "float16" if device == "cuda" else "int8"
+                log.info(f"  Cargando faster-whisper large-v3 en {device} ({compute})...")
+                _whisper_model = ("faster", WhisperModel("large-v3", device=device, compute_type=compute))
+                log.info("  faster-whisper listo.")
+            except Exception as e2:
+                log.error(f"  faster-whisper también falló: {e2}")
+                _whisper_model = None
     return _whisper_model
+
+
+def _transcribe(audio_path):
+    model_info = _get_whisper()
+    if model_info is None:
+        raise RuntimeError("Ningún modelo Whisper disponible")
+    kind, model = model_info
+    words_timing = []
+    if kind == "openai":
+        import torch
+        result = model.transcribe(audio_path, language="es", word_timestamps=True,
+                                  fp16=torch.cuda.is_available())
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                raw = w.get("word", "").strip()
+                if raw:
+                    words_timing.append({"word": raw, "start": float(w["start"]), "end": float(w["end"])})
+    else:  # faster-whisper
+        segments, _ = model.transcribe(audio_path, language="es", word_timestamps=True)
+        for seg in segments:
+            for w in seg.words:
+                if w.word.strip():
+                    words_timing.append({"word": w.word.strip(), "start": float(w.start), "end": float(w.end)})
+    log.info(f"  Whisper ({kind}): {len(words_timing)} palabras")
+    return words_timing
 
 
 def run_ffmpeg(cmd, desc=""):
@@ -170,10 +227,7 @@ def generar_ass_guion(escenas, duracion_total, ass_path):
 
 
 def upload_to_drive(file_path, folder_id, sa_json_raw, rclone_token=""):
-    """Sube el MP4 a Google Drive usando rclone con token OAuth."""
     filename = os.path.basename(file_path)
-
-    # Escribir config rclone temporal
     cfg_content = f"""[gdrive]
 type = drive
 scope = drive
@@ -182,21 +236,17 @@ token = {rclone_token}
     with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False) as cfg_file:
         cfg_file.write(cfg_content)
         cfg_path = cfg_file.name
-
     try:
-        dest = f"gdrive:{folder_id}/{filename}"
         cmd = ["rclone", "copy", "--config", cfg_path, file_path, f"gdrive:{folder_id}"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"rclone error: {result.stderr}")
-
-        # Obtener file ID
         ls_cmd = ["rclone", "lsjson", "--config", cfg_path, f"gdrive:{folder_id}", "--files-only"]
         ls_result = subprocess.run(ls_cmd, capture_output=True, text=True)
         files = json.loads(ls_result.stdout) if ls_result.stdout.strip() else []
         file_id = next((f["ID"] for f in files if f["Name"] == filename), None)
         url = f"https://drive.google.com/file/d/{file_id}/view" if file_id else ""
-        log.info(f"  ✓ Archivo en Drive: {url}")
+        log.info(f"  ✓ Drive: {url}")
         return file_id, url
     finally:
         os.unlink(cfg_path)
@@ -281,25 +331,17 @@ def handler(job):
 
         words_timing = []
         try:
-            import torch
-            result = _get_whisper().transcribe(
-                audio_path, language="es", word_timestamps=True,
-                fp16=torch.cuda.is_available()
-            )
-            for seg in result.get("segments", []):
-                for w in seg.get("words", []):
-                    raw = w.get("word", "").strip()
-                    if raw:
-                        words_timing.append({"word": raw, "start": float(w["start"]), "end": float(w["end"])})
+            log.info("  Iniciando transcripción Whisper...")
+            words_timing = _transcribe(audio_path)
             words_count = len(words_timing)
-            log.info(f"  ✓ Whisper: {words_count} palabras")
         except Exception as e:
-            log.warning(f"  ⚠ Whisper falló: {e}")
+            log.error(f"  ✗ Whisper falló completamente: {e}")
 
         ass_path = f"{subs_dir}/subtitulos.ass"
         if words_timing:
             generar_ass_whisper(words_timing, duracion_seg, ass_path)
         elif escenas:
+            log.warning("  Usando fallback subtítulos por guión")
             generar_ass_guion(escenas, duracion_seg, ass_path)
         else:
             ass_path = None
