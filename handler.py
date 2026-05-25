@@ -2,11 +2,16 @@
 handler.py — RunPod Serverless · Montaje de Vídeo Bíblico
 """
 
-import os, json, base64, logging, subprocess, shutil, time, tempfile
+import os, json, base64, logging, subprocess, shutil, time, tempfile, sys
 import requests
 import runpod
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout
+)
 log = logging.getLogger("montaje-worker")
 
 IMAGE_WIDTH  = 1536
@@ -50,7 +55,7 @@ def _log_gpu_info():
             vram_used  = torch.cuda.memory_allocated(0) / 1024**3
             log.info(f"  VRAM total: {vram_total:.1f} GB — usada: {vram_used:.1f} GB")
         else:
-            log.warning("  CUDA no disponible — Whisper correrá en CPU (lento)")
+            log.warning("  CUDA no disponible — Whisper correrá en CPU")
     except Exception as e:
         log.warning(f"  No se pudo obtener info GPU: {e}")
 
@@ -58,7 +63,6 @@ def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
         _log_gpu_info()
-        # Intento 1: openai-whisper
         try:
             import torch, whisper
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,13 +70,13 @@ def _get_whisper():
             _whisper_model = ("openai", whisper.load_model("large", device=device))
             log.info("  openai-whisper large listo.")
         except Exception as e:
-            log.warning(f"  openai-whisper falló: {e}")
-            # Intento 2: faster-whisper
+            log.warning(f"  openai-whisper falló al cargar: {e}")
             try:
                 from faster_whisper import WhisperModel
-                device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
                 compute = "float16" if device == "cuda" else "int8"
-                log.info(f"  Cargando faster-whisper large-v3 en {device} ({compute})...")
+                log.info(f"  Cargando faster-whisper large-v3 en {device}...")
                 _whisper_model = ("faster", WhisperModel("large-v3", device=device, compute_type=compute))
                 log.info("  faster-whisper listo.")
             except Exception as e2:
@@ -87,8 +91,10 @@ def _transcribe(audio_path):
         raise RuntimeError("Ningún modelo Whisper disponible")
     kind, model = model_info
     words_timing = []
+
     if kind == "openai":
         import torch
+        log.info("  Transcribiendo con openai-whisper...")
         result = model.transcribe(audio_path, language="es", word_timestamps=True,
                                   fp16=torch.cuda.is_available())
         for seg in result.get("segments", []):
@@ -96,13 +102,22 @@ def _transcribe(audio_path):
                 raw = w.get("word", "").strip()
                 if raw:
                     words_timing.append({"word": raw, "start": float(w["start"]), "end": float(w["end"])})
+        log.info(f"  openai-whisper devolvió {len(words_timing)} palabras")
+        if len(words_timing) == 0:
+            raise RuntimeError(
+                "openai-whisper transcribió OK pero devolvió 0 palabras "
+                "(posible falta de dtw-python o word_timestamps vacío) — "
+                "intentando faster-whisper"
+            )
     else:  # faster-whisper
+        log.info("  Transcribiendo con faster-whisper...")
         segments, _ = model.transcribe(audio_path, language="es", word_timestamps=True)
         for seg in segments:
             for w in seg.words:
                 if w.word.strip():
                     words_timing.append({"word": w.word.strip(), "start": float(w.start), "end": float(w.end)})
-    log.info(f"  Whisper ({kind}): {len(words_timing)} palabras")
+        log.info(f"  faster-whisper devolvió {len(words_timing)} palabras")
+
     return words_timing
 
 
@@ -336,6 +351,23 @@ def handler(job):
             words_count = len(words_timing)
         except Exception as e:
             log.error(f"  ✗ Whisper falló completamente: {e}")
+            # segundo intento con faster-whisper directo
+            try:
+                log.info("  Intentando faster-whisper directamente...")
+                from faster_whisper import WhisperModel
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute = "float16" if device == "cuda" else "int8"
+                fw_model = WhisperModel("large-v3", device=device, compute_type=compute)
+                segments, _ = fw_model.transcribe(audio_path, language="es", word_timestamps=True)
+                for seg in segments:
+                    for w in seg.words:
+                        if w.word.strip():
+                            words_timing.append({"word": w.word.strip(), "start": float(w.start), "end": float(w.end)})
+                words_count = len(words_timing)
+                log.info(f"  faster-whisper directo: {words_count} palabras")
+            except Exception as e2:
+                log.error(f"  ✗ faster-whisper directo también falló: {e2}")
 
         ass_path = f"{subs_dir}/subtitulos.ass"
         if words_timing:
