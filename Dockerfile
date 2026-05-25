@@ -29,6 +29,7 @@ RUN pip install --no-cache-dir 'numpy<2'
 RUN pip install --no-cache-dir \
         runpod==1.9.0 \
         openai-whisper \
+        dtw-python \
         faster-whisper \
         requests \
         pillow \
